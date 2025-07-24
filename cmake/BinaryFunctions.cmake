@@ -26,109 +26,105 @@
 
 include(${CMAKE_CURRENT_LIST_DIR}/BinaryLibraryFunctions.cmake)
 
-# Internal function to append unique packages to a list
+# -----------------------------------------------------------------------------
+# Append items from SOURCE_LIST into LIST_NAME if they are not already present
+# -----------------------------------------------------------------------------
 function(_append_unique_packages LIST_NAME SOURCE_LIST)
     if(DEFINED "${SOURCE_LIST}" AND NOT "${${SOURCE_LIST}}" STREQUAL "")
-        foreach(PACKAGE ${${SOURCE_LIST}})
-            list(FIND "${LIST_NAME}" "${PACKAGE}" INDEX)
-            if(INDEX EQUAL -1)
-                list(APPEND "${LIST_NAME}" "${PACKAGE}")
+        foreach(PKG ${${SOURCE_LIST}})
+            list(FIND ${LIST_NAME} "${PKG}" _idx)
+            if(_idx EQUAL -1)
+                list(APPEND ${LIST_NAME} "${PKG}")
             endif()
         endforeach()
-        set("${LIST_NAME}" "${${LIST_NAME}}" PARENT_SCOPE)
+        set(${LIST_NAME} "${${LIST_NAME}}" PARENT_SCOPE)
     endif()
 endfunction()
 
-# Construct a list of packages to include for find_package
+# -----------------------------------------------------------------------------
+# Build a *flat* list of all packages referenced by binaries / tests
+# -----------------------------------------------------------------------------
 function(construct_package_list RESULT_VAR)
-    # Initialize the packages list
     set(PACKAGES "")
 
-    # Add global third-party packages
     _append_unique_packages(PACKAGES THIRD_PARTY_PACKAGES)
 
-    # Add binary source-specific packages
-    if(DEFINED BINARY_SOURCES AND NOT "${BINARY_SOURCES}" STREQUAL "")
-        foreach(TARGET_NAME ${BINARY_SOURCES})
-            _append_unique_packages(PACKAGES "${TARGET_NAME}_THIRD_PARTY_PACKAGES")
+    if(DEFINED BINARY_SOURCES)
+        foreach(TGT ${BINARY_SOURCES})
+            _append_unique_packages(PACKAGES "${TGT}_THIRD_PARTY_PACKAGES")
         endforeach()
     endif()
 
-    # Add test source-specific packages
-    if(DEFINED TEST_SOURCES AND NOT "${TEST_SOURCES}" STREQUAL "")
-        foreach(TARGET_NAME ${TEST_SOURCES})
-            _append_unique_packages(PACKAGES "${TARGET_NAME}_THIRD_PARTY_PACKAGES")
+    if(DEFINED TEST_SOURCES)
+        foreach(TGT ${TEST_SOURCES})
+            _append_unique_packages(PACKAGES "${TGT}_THIRD_PARTY_PACKAGES")
         endforeach()
     endif()
 
-    # Add binary source-specific packages
-    if(DEFINED BINARY_SOURCES AND NOT "${BINARY_SOURCES}" STREQUAL "")
-        foreach(TARGET_NAME ${BINARY_SOURCES})
-            _append_unique_packages(PACKAGES "${TARGET_NAME}_CUSTOM_PACKAGES")
+    if(DEFINED BINARY_SOURCES)
+        foreach(TGT ${BINARY_SOURCES})
+            _append_unique_packages(PACKAGES "${TGT}_CUSTOM_PACKAGES")
         endforeach()
     endif()
 
-    # Add test source-specific packages
-    if(DEFINED TEST_SOURCES AND NOT "${TEST_SOURCES}" STREQUAL "")
-        foreach(TARGET_NAME ${TEST_SOURCES})
-            _append_unique_packages(PACKAGES "${TARGET_NAME}_CUSTOM_PACKAGES")
+    if(DEFINED TEST_SOURCES)
+        foreach(TGT ${TEST_SOURCES})
+            _append_unique_packages(PACKAGES "${TGT}_CUSTOM_PACKAGES")
         endforeach()
     endif()
 
-    # Add main library
     _append_unique_packages(PACKAGES LIB_TO_TEST)
-
-    # Add global custom packages
     _append_unique_packages(PACKAGES CUSTOM_PACKAGES)
 
-    # Set the resulting packages variable
-    set("${RESULT_VAR}" "${PACKAGES}" PARENT_SCOPE)
+    set(${RESULT_VAR} "${PACKAGES}" PARENT_SCOPE)
 endfunction()
 
-# Internal function to construct the packages variable
-function(construct_packages_variable HEADER_RESULT_VAR RESULT_VAR LIB_TO_TEST CUSTOM_PACKAGES THIRD_PARTY_PACKAGES LIB_STYLE)
-    # Initialize the packages list
-    set(PACKAGES "")
-    set(HEADER_ONLY_PACKAGES "")
+# -----------------------------------------------------------------------------
+# Helper that decides whether to use <pkg>::static / ::shared or header‑only
+# -----------------------------------------------------------------------------
+function(construct_packages_variable HEADER_RESULT_VAR RESULT_VAR
+                                      LIB_TO_TEST CUSTOM_PACKAGES
+                                      THIRD_PARTY_PACKAGES LIB_STYLE)
+    set(PACKAGES           "")
+    set(HEADER_ONLY_PKGS   "")
 
-    # Include the main library if defined and valid
+    # ----- main library -------------------------------------------------------
     if(NOT "${LIB_TO_TEST}" STREQUAL "")
-        is_header_only_library("${LIB_TO_TEST}" IS_HEADER_ONLY)
-        if(IS_HEADER_ONLY)
-            list(APPEND HEADER_ONLY_PACKAGES "${LIB_TO_TEST}::${PACKAGE}")
+        is_header_only_library("${LIB_TO_TEST}" _is_header_only)
+        if(_is_header_only)
+            list(APPEND HEADER_ONLY_PKGS "${LIB_TO_TEST}::${LIB_TO_TEST}")
         else()
             list(APPEND PACKAGES "${LIB_TO_TEST}::${LIB_STYLE}")
         endif()
     endif()
 
-    # Include custom packages
+    # ----- custom packages ----------------------------------------------------
     if(NOT "${CUSTOM_PACKAGES}" STREQUAL "")
-        foreach(PACKAGE ${CUSTOM_PACKAGES})
-            if(NOT "${PACKAGE}" STREQUAL "${LIB_TO_TEST}")
-                is_header_only_library("${PACKAGE}" IS_HEADER_ONLY)
-                if(IS_HEADER_ONLY)
-                    list(APPEND HEADER_ONLY_PACKAGES "${PACKAGE}::${PACKAGE}")
+        foreach(PKG ${CUSTOM_PACKAGES})
+            if(NOT "${PKG}" STREQUAL "${LIB_TO_TEST}")
+                is_header_only_library("${PKG}" _is_header_only)
+                if(_is_header_only)
+                    list(APPEND HEADER_ONLY_PKGS "${PKG}::${PKG}")
                 else()
-                    list(APPEND PACKAGES "${PACKAGE}::${LIB_STYLE}")
+                    list(APPEND PACKAGES "${PKG}::${LIB_STYLE}")
                 endif()
             endif()
         endforeach()
     endif()
 
-    # Include third-party packages
+    # ----- third‑party packages ----------------------------------------------
     if(NOT "${THIRD_PARTY_PACKAGES}" STREQUAL "")
-        foreach(PACKAGE ${THIRD_PARTY_PACKAGES})
-            if(${PACKAGE} MATCHES "::")
-                list(APPEND PACKAGES "${PACKAGE}")
+        foreach(PKG ${THIRD_PARTY_PACKAGES})
+            if("${PKG}" MATCHES "::")
+                list(APPEND PACKAGES "${PKG}")
             else()
-                list(APPEND PACKAGES "${PACKAGE}::${PACKAGE}")
+                list(APPEND PACKAGES "${PKG}::${PKG}")
             endif()
         endforeach()
     endif()
 
-    # Set the resulting packages variable
-    set("${RESULT_VAR}" "${PACKAGES}" PARENT_SCOPE)
-    set("${HEADER_RESULT_VAR}" "${HEADER_ONLY_PACKAGES}" PARENT_SCOPE)
+    set(${RESULT_VAR}        "${PACKAGES}"         PARENT_SCOPE)
+    set(${HEADER_RESULT_VAR} "${HEADER_ONLY_PKGS}" PARENT_SCOPE)
 endfunction()
 
 # Constructs a variable based upon the target-specific before the global

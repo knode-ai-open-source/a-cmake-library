@@ -47,69 +47,112 @@
 #   4. Registers tests (if applicable) with CTest.
 ####################################################################################################
 
-# Options
-option(ADDRESS_SANITIZER "Enable Address Sanitizer" OFF)
+# ---- Options -----------------------------------------------------------------
+option(ADDRESS_SANITIZER   "Enable Address Sanitizer"        OFF)
 option(ENABLE_CODE_COVERAGE "Enable code coverage reporting" OFF)
-option(ENABLE_CLANG_TIDY "Enable Clang-Tidy analysis" OFF)
-option(STATIC_BUILD "Link against static library" OFF)
-option(SHARED_BUILD "Link against shared library" OFF)
-option(DEBUG_BUILD "Link against debug library" ON)
+option(ENABLE_CLANG_TIDY   "Enable Clang‑Tidy analysis"      OFF)
+option(STATIC_BUILD        "Link against static library"     OFF)
+option(SHARED_BUILD        "Link against shared library"     OFF)
+option(DEBUG_BUILD         "Link against debug library"      ON)
 
-# C version
-set(CMAKE_C_STANDARD 23)
+# ---- C standard guard ---------------------------------------------------------
+include(CheckCCompilerFlag)
+check_c_compiler_flag("-std=c23" _HAS_C23)
+if (_HAS_C23)
+    set(CMAKE_C_STANDARD 23)
+else()
+    set(CMAKE_C_STANDARD 17)
+endif()
 set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_C_EXTENSIONS OFF)
 
-# Compiler options
-if(ADDRESS_SANITIZER)
+# ---- Sanitizers / tooling -----------------------------------------------------
+if (ADDRESS_SANITIZER)
     add_compile_options(-fsanitize=address)
 endif()
-
-if(ENABLE_CLANG_TIDY)
+if (ENABLE_CLANG_TIDY)
     set(CMAKE_C_CLANG_TIDY clang-tidy)
-endif()
-
-if(EXISTS "/opt/homebrew/opt/openssl")
-    # Add the path if it exists
-    set(OpenSSL_DIR "/opt/homebrew/opt/openssl/lib/cmake/OpenSSL")
-    message(STATUS "set OpenSSL_DIR to ${OpenSSL_DIR}")
-else()
-    message(STATUS "/opt/homebrew/opt/openssl does not exist (maybe not a mac?)")
 endif()
 
 include(${CMAKE_CURRENT_LIST_DIR}/BinaryFunctions.cmake)
 
 construct_package_list(PACKAGE_LIST)
-if(PACKAGE_LIST)
-    foreach(PACKAGE ${PACKAGE_LIST})
-        find_generic_package(${PACKAGE})
-#        message(STATUS "find_package (binary) ${PACKAGE}")
-#        if(${PACKAGE} MATCHES "OpenSSL")
-#            find_package(OpenSSL REQUIRED)
-#        elseif (${PACKAGE} STREQUAL "nonstd::expected-lite")
-#            find_package(expected-lite REQUIRED)
-#        else()
-#            find_package(${PACKAGE} REQUIRED)
-#        endif()
-    endforeach()
-endif()
+foreach(PACKAGE IN LISTS PACKAGE_LIST)
+    find_generic_package(${PACKAGE})
+endforeach()
 
-if(SHARED_BUILD)
+# ---- Optimisation profile selection ------------------------------------------
+if (SHARED_BUILD)
     set(LIB_STYLE shared)
     add_compile_options(-O2)
-elseif(STATIC_BUILD)
+elseif (STATIC_BUILD)
     set(LIB_STYLE static)
     add_compile_options(-O3)
 else()
     set(LIB_STYLE debug)
-    # add_compile_definitions(-D_AML_DEBUG_)
     add_compile_options(-g -O0)
 endif()
 
+# Recursively collect INTERFACE deps for a target
+function(_collect_deps tgt out_var)
+    if(NOT TARGET "${tgt}")
+        set(${out_var} "" PARENT_SCOPE)
+        return()
+    endif()
+
+    get_target_property(_deps "${tgt}" INTERFACE_LINK_LIBRARIES)
+    if(NOT _deps)
+        set(_deps "")
+    endif()
+
+    set(_seen "")
+    foreach(d IN LISTS _deps)
+        if(TARGET "${d}")
+            list(APPEND _seen "${d}")
+            _collect_deps("${d}" _sub)
+            list(APPEND _seen ${_sub})
+        endif()
+    endforeach()
+
+    list(REMOVE_DUPLICATES _seen)
+    set(${out_var} "${_seen}" PARENT_SCOPE)
+endfunction()
+
+# Remove from IN_LIST every target that is a transitive dep of another target in the list
+function(prune_root_packages IN_LIST OUT_LIST)
+    set(_in "${${IN_LIST}}")
+    set(_remove "")
+
+    foreach(root IN LISTS _in)
+        if(TARGET "${root}")
+            _collect_deps("${root}" _deps)
+            foreach(d IN LISTS _deps)
+                list(FIND _in "${d}" _idx)
+                if(NOT _idx EQUAL -1)
+                    list(APPEND _remove "${d}")
+                endif()
+            endforeach()
+        endif()
+    endforeach()
+
+    list(REMOVE_DUPLICATES _remove)
+    set(_pruned "${_in}")
+    foreach(r IN LISTS _remove)
+        list(REMOVE_ITEM _pruned "${r}")
+    endforeach()
+    list(REMOVE_DUPLICATES _pruned)
+
+    set(${OUT_LIST} "${_pruned}" PARENT_SCOPE)
+endfunction()
+
+
 construct_packages("")
 
-if(NOT DEFINED PACKAGES OR PACKAGES STREQUAL "")
+if (PACKAGES STREQUAL "")
     unset(PACKAGES)
+else()
+    prune_root_packages(PACKAGES PACKAGES_PRUNED)
+    set(PACKAGES "${PACKAGES_PRUNED}")
 endif()
 
 message(STATUS "Linking against ${PACKAGES}")
@@ -117,53 +160,33 @@ message(STATUS "Linking against ${PACKAGES}")
 include(${CMAKE_CURRENT_LIST_DIR}/CodeCoverage.cmake)
 include(${CMAKE_CURRENT_LIST_DIR}/CodeCoverageCustomTarget.cmake)
 
-# Include directories for the main library
-include_directories(${CMAKE_SOURCE_DIR}/include)
+include_directories(${CMAKE_SOURCE_DIR}/include)   # main library headers
 
-# Add test executables
-foreach(BINARY_SOURCE ${BINARY_SOURCES})
-    # Extract test name (e.g., test_io.c -> test_io)
+# ---- Regular executables ------------------------------------------------------
+foreach(BINARY_SOURCE IN LISTS BINARY_SOURCES)
     get_filename_component(BINARY_NAME ${BINARY_SOURCE} NAME_WE)
-
-    # Collect the base source for the test
     set(CURRENT_BINARY_SOURCES ${BINARY_SOURCE})
-
-    # Check if additional sources are defined for the BINARY
     if(DEFINED ${BINARY_NAME}_SOURCES)
         list(APPEND CURRENT_BINARY_SOURCES ${${BINARY_NAME}_SOURCES})
     endif()
-
-    # Add executable for the test with the collected sources
     add_executable(${BINARY_NAME} ${CURRENT_BINARY_SOURCES})
-
-    # Link against the chosen library
-    if(PACKAGES)
-        target_link_libraries(${BINARY_NAME} PRIVATE ${PACKAGES} -lm -lpthread)
+    if (PACKAGES)
+        list(REMOVE_DUPLICATES PACKAGES)
+        target_link_libraries(${BINARY_NAME} PRIVATE ${PACKAGES})
     endif()
 endforeach()
 
-
-# Add test executables
-foreach(TEST_SOURCE ${TEST_SOURCES})
-    # Extract test name (e.g., test_io.c -> test_io)
+# ---- Tests --------------------------------------------------------------------
+foreach(TEST_SOURCE IN LISTS TEST_SOURCES)
     get_filename_component(TEST_NAME ${TEST_SOURCE} NAME_WE)
-
-    # Collect the base source for the test
     set(CURRENT_TEST_SOURCES ${TEST_SOURCE})
-
-    # Check if additional sources are defined for the test
     if(DEFINED ${TEST_NAME}_SOURCES)
         list(APPEND CURRENT_TEST_SOURCES ${${TEST_NAME}_SOURCES})
     endif()
-
-    # Add executable for the test with the collected sources
     add_executable(${TEST_NAME} ${CURRENT_TEST_SOURCES})
-
-    # Link against the chosen library
-    if(PACKAGES)
-        target_link_libraries(${TEST_NAME} PRIVATE ${PACKAGES} -lm -lpthread)
+    if (PACKAGES)
+        list(REMOVE_DUPLICATES PACKAGES)
+        target_link_libraries(${TEST_NAME} PRIVATE ${PACKAGES})
     endif()
-
-    # Register the test with CTest
     add_test(NAME ${TEST_NAME} COMMAND ${TEST_NAME})
 endforeach()

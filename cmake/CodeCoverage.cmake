@@ -19,25 +19,30 @@
 #    `-ftest-coverage`, etc.).
 # 5. Displays a warning and disables coverage if no suitable tool is found.
 ################################################################################
-
-if(ENABLE_CODE_COVERAGE)
+if (ENABLE_CODE_COVERAGE)
     include(CheckCXXCompilerFlag)
     check_cxx_compiler_flag("--coverage" HAS_COVERAGE_FLAG)
-    if(HAS_COVERAGE_FLAG)
+
+    # Compile‑time instrumentation ------------------------------------------------
+    if (HAS_COVERAGE_FLAG)
         add_compile_options(--coverage)
-        link_libraries(--coverage)
+        set(COVERAGE_LIBS "--coverage")
     else()
-        find_program(LLVM_COV_EXECUTABLE llvm-cov)
-        find_program(GCOV_EXECUTABLE gcov)
-        if(LLVM_COV_EXECUTABLE)
+        find_program(LLVM_COV_EXECUTABLE llvm-cov QUIET)
+        find_program(GCOV_EXECUTABLE   gcov     QUIET)
+
+        if (LLVM_COV_EXECUTABLE)
             add_compile_options(-fprofile-instr-generate -fcoverage-mapping)
-            link_libraries(-fprofile-instr-generate -fcoverage-mapping)
-        elseif(GCOV_EXECUTABLE)
+            set(COVERAGE_LIBS "-fprofile-instr-generate;-fcoverage-mapping")
+        elseif (GCOV_EXECUTABLE)
             add_compile_options(-fprofile-arcs -ftest-coverage)
-            link_libraries(-fprofile-arcs -ftest-coverage)
+            set(COVERAGE_LIBS "-fprofile-arcs;-ftest-coverage")
         else()
-            message(WARNING "No suitable code coverage tool found. Code coverage is disabled.")
+            message(WARNING "No suitable code‑coverage tool found – disabling coverage.")
             set(ENABLE_CODE_COVERAGE OFF)
+            set(COVERAGE_LIBS "")
         endif()
     endif()
+else()
+    set(COVERAGE_LIBS "")
 endif()

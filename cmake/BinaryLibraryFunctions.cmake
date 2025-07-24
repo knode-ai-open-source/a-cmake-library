@@ -2,57 +2,138 @@
 # SPDX-FileCopyrightText: 2024-2025 Knode.ai
 # SPDX-License-Identifier: Apache-2.0
 
-# Add -lm (math library) and -lpthread (thread library) globally
-set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -lm -lpthread")
-set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -lm -lpthread")
-set(CMAKE_MODULE_LINKER_FLAGS "${CMAKE_MODULE_LINKER_FLAGS} -lm -lpthread")
-
-# add_compile_definitions(_GNU_SOURCE)
+# -----------------------------------------------------------------------------
+# Minimal, portable defaults
+# -----------------------------------------------------------------------------
 add_compile_definitions(_GNU_SOURCE)
-if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
-    add_compile_options(-mavx2 -mfma)
-elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "arm")
-    add_compile_options(-mfpu=neon)
-elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64")
-    message(STATUS "NEON enabled by default on AArch64")
-else()
-    message(FATAL_ERROR "Unsupported architecture for SIMD")
+
+# SIMD / CPU‑specific opts – **only** when the host tool‑chain can accept them
+include(CheckCCompilerFlag)
+
+if (NOT CMAKE_CROSSCOMPILING AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    if (CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
+        check_c_compiler_flag("-mavx2"  _HAS_MAVX2)
+        check_c_compiler_flag("-mfma"   _HAS_MFMA)
+        if (_HAS_MAVX2)
+            add_compile_options(-mavx2)
+        endif()
+        if (_HAS_MFMA)
+            add_compile_options(-mfma)
+        endif()
+    elseif (CMAKE_SYSTEM_PROCESSOR MATCHES "arm")
+        check_c_compiler_flag("-mfpu=neon" _HAS_NEON)
+        if (_HAS_NEON)
+            add_compile_options(-mfpu=neon)
+        endif()
+    endif()
 endif()
 
-if(EXISTS "/opt/homebrew")
+# Homebrew helper (macOS)
+if (EXISTS "/opt/homebrew")
     message(STATUS "Homebrew detected at /opt/homebrew")
     include_directories("/opt/homebrew/include")
     link_directories("/opt/homebrew/lib")
 endif()
 
+# -----------------------------------------------------------------------------
+# Utility: check if a *find_package* set a FOUND variable
+# -----------------------------------------------------------------------------
 function(is_package_found PACKAGE_NAME OUTPUT_VAR)
-    # Default to false
     set(${OUTPUT_VAR} FALSE PARENT_SCOPE)
-
-    # Check if <PACKAGE_NAME>_FOUND exists and is true
     if(DEFINED ${PACKAGE_NAME}_FOUND AND ${PACKAGE_NAME}_FOUND)
         set(${OUTPUT_VAR} TRUE PARENT_SCOPE)
     endif()
-
-    string(TOUPPER "${PACKAGE_NAME}" UPPER_PACKAGE_NAME)
-    if(DEFINED ${UPPER_PACKAGE_NAME}_FOUND AND ${UPPER_PACKAGE_NAME}_FOUND)
+    string(TOUPPER "${PACKAGE_NAME}" UPPER)
+    if(DEFINED ${UPPER}_FOUND AND ${UPPER}_FOUND)
         set(${OUTPUT_VAR} TRUE PARENT_SCOPE)
     endif()
 endfunction()
 
+# ------------------------------------------------------------------------------
+# create_imported_package_target
+#
+# Makes a tiny INTERFACE IMPORTED target when the upstream CMake / pkg-config
+# file didn’t create one itself.  In addition to the include-directories it
+# now tries to resolve every bare   jansson   openssl   gnutls   …  token to the
+# *full path* of the real library, and publishes that path (or at least its
+# parent directory) so the link-step never needs a global  link_directories().
+#
+# Usage:
+#   create_imported_package_target(
+#        <new-target-name>            # e.g.   jansson::jansson
+#        "<include-dir>;<include2>"   # include search path(s)
+#        "<libA>;<libB>"              # what the .pc file exposed
+#   )
+# ------------------------------------------------------------------------------
 function(create_imported_package_target TARGET_NAME INCLUDE_DIRS LIBRARIES)
-    if(NOT TARGET "${TARGET_NAME}")
-        add_library("${TARGET_NAME}" INTERFACE IMPORTED)
-        # Include dirs
+    # Skip if someone already provided a proper target
+    if(TARGET "${TARGET_NAME}")
+        return()
+    endif()
+
+    add_library("${TARGET_NAME}" INTERFACE IMPORTED)
+
+    # --------------------------------------------------------  include-dirs
+    if(INCLUDE_DIRS)
         set_target_properties("${TARGET_NAME}" PROPERTIES
-            INTERFACE_INCLUDE_DIRECTORIES "${INCLUDE_DIRS}"
+            INTERFACE_INCLUDE_DIRECTORIES "${INCLUDE_DIRS}")
+    endif()
+
+    # --------------------------------------------------------  resolve libs
+    set(_resolved_libs "")      # what we’ll publish
+    set(_link_dirs     "")      # extra -L path(s) to expose, if any
+
+    foreach(_lib IN LISTS LIBRARIES)
+        # ---------------------------------------------------------------
+        # 1) Already a full path / imported target / file‑name → keep verbatim
+        # ---------------------------------------------------------------
+        if(_lib MATCHES "^/.*"                # absolute path
+           OR _lib MATCHES "\\.(a|so|dylib)$" # explicit file
+           OR _lib MATCHES "::"               # imported target
         )
-        # Link libs if any
-        if(LIBRARIES)
-            set_target_properties("${TARGET_NAME}" PROPERTIES
-                INTERFACE_LINK_LIBRARIES "${LIBRARIES}"
-            )
+            list(APPEND _resolved_libs "${_lib}")
+            continue()
         endif()
+
+        # ---------------------------------------------------------------
+        # 2) Handle the pkg‑config style “‑lname”  →  name = <match 1>
+        # ---------------------------------------------------------------
+        if(_lib MATCHES "^-l(.+)$")
+            set(_basename "${CMAKE_MATCH_1}")
+        else()
+            set(_basename "${_lib}")
+        endif()
+
+        # ---------------------------------------------------------------
+        # 3) Try to locate a real file lib<basename>.(so|dylib|a)
+        # ---------------------------------------------------------------
+        find_library(
+            _full_path
+            NAMES        "${_basename}"
+            PATHS        /usr/local/lib /opt/homebrew/lib /usr/lib /usr/local/opt
+        )
+
+        if(_full_path)
+            list(APPEND _resolved_libs "${_full_path}")
+            get_filename_component(_dir "${_full_path}" DIRECTORY)
+            list(APPEND _link_dirs "${_dir}")
+        else()
+            # couldn’t resolve → leave token untouched
+            list(APPEND _resolved_libs "${_lib}")
+        endif()
+    endforeach()
+
+    # --------------------------------------------------------  publish props
+    if(_resolved_libs)
+        list(REMOVE_DUPLICATES _resolved_libs)
+        set_target_properties("${TARGET_NAME}" PROPERTIES
+            INTERFACE_LINK_LIBRARIES "${_resolved_libs}")
+    endif()
+
+    if(_link_dirs)
+        list(REMOVE_DUPLICATES _link_dirs)
+        set_target_properties("${TARGET_NAME}" PROPERTIES
+            INTERFACE_LINK_DIRECTORIES "${_link_dirs}")
     endif()
 endfunction()
 
@@ -137,222 +218,229 @@ function(find_generic_target TARGET_NAME FOUND_PACKAGE)
     message(STATUS "Could not find target: \"${TARGET_NAME}\"")
 endfunction()
 
-function(_find_generic_package_quiet PACKAGE_NAME FOUND_PACKAGE)
-    message(STATUS "Trying to find \"${PACKAGE_NAME}\"")
-
-    # ------------------------------------------------------------------
-    # Default: assume we won't find it
-    # ------------------------------------------------------------------
-    set(${FOUND_PACKAGE} "not_found" PARENT_SCOPE)
-
-    # ------------------------------------------------------------------
-    # Handle imported-target names (those containing "::") first
-    # ------------------------------------------------------------------
-    if("${PACKAGE_NAME}" MATCHES "::")
-        # 1) See if the target already exists, or can be found via helper
-        find_generic_target("${PACKAGE_NAME}" FOUND_TARGET_PACKAGE)
-        if(NOT "${FOUND_TARGET_PACKAGE}" STREQUAL "not_found")
-            set(${FOUND_PACKAGE} "${FOUND_TARGET_PACKAGE}" PARENT_SCOPE)
-        endif()
-        # ▲ NEW:  For target-style names we never fall through to pkg-config
-        return()
+function(_ensure_pkgconfig_target MODULE_NAME)
+    # 1. Run pkg‑config (once) to fill <MOD>_INCLUDE_DIRS / _LIBRARIES
+    find_package(PkgConfig QUIET)
+    if (PKG_CONFIG_FOUND)
+        pkg_check_modules(${MODULE_NAME} QUIET ${MODULE_NAME})
     endif()
 
-    # ------------------------------------------------------------------
-    # Try the classic find_package() search
-    # ------------------------------------------------------------------
-    find_package("${PACKAGE_NAME}" QUIET)
-    if("${PACKAGE_NAME}" STREQUAL "libjwt")
-        # List all imported targets that exist right now
-        get_property(_afterLibjwt DIRECTORY PROPERTY IMPORTED_TARGETS)
-        message(STATUS "[probe] IMPORTED_TARGETS after libjwt: ${_afterLibjwt}")
-
-        # Show the classic variables too
-        message(STATUS "[probe] LIBJWT_LIBRARY        = ${LIBJWT_LIBRARY}")
-        message(STATUS "[probe] LIBJWT_INCLUDE_DIRS   = ${LIBJWT_INCLUDE_DIRS}")
-    endif()
-
-    # ▲ NEW: if the OpenSSL *module* was picked up but imported targets are
-    #        still missing, force the CONFIG variant that defines them.
-    if("${PACKAGE_NAME}" STREQUAL "OpenSSL" AND NOT TARGET OpenSSL::Crypto)
-        find_package(OpenSSL CONFIG REQUIRED)
-    endif()
-
-    is_package_found("${PACKAGE_NAME}" PACKAGE_FOUND)
-    if(PACKAGE_FOUND)
-        # ----- auto-namespace single bare targets -------------------------------
-        get_property(_pkg_targets DIRECTORY PROPERTY IMPORTED_TARGETS)
-        list(FILTER _pkg_targets INCLUDE REGEX "^[A-Za-z0-9_]+$")   # bare names
-        list(LENGTH _pkg_targets _pkg_count)
-
-        # ► DEBUG – show what we discovered
-        message(STATUS "[alias] bare targets: ${_pkg_targets}")
-        message(STATUS "[alias] count       : ${_pkg_count}")
-        message(STATUS "[alias] jwt exists? : $<BOOL:$<TARGET_EXISTS:jwt>>")
-
-        if(_pkg_count EQUAL 1)
-            list(GET _pkg_targets 0 _bare)
-            set(_alias "${PACKAGE_NAME}::${PACKAGE_NAME}")
-            message(STATUS "[alias] creating ${_alias} -> ${_bare}")
-            if(NOT TARGET "${_alias}")
-                add_library("${_alias}" ALIAS "${_bare}")
-            endif()
-        endif()
-
-        unset(_pkg_targets)
-        unset(_pkg_count)
-        unset(_bare)
-        unset(_alias)
-        # ------------------------------------------------------------------------
-        message(STATUS "Found \"${PACKAGE_NAME}\" with find_package")
-        #
-        # ──────────────────────────────────────────────────────────────────────────
-        #  SELF-HEAL FOR “PkgConfig::<module>” PLACE-HOLDER TARGETS
-        #
-        #  Some packages (libjwt, libepoxy, cairo,…​) ship CMake configs that add
-        #  imported targets whose *link interface* refers to
-        #       PkgConfig::<MODULE>
-        #  but do **not** create that target themselves.  When it’s missing CMake
-        #  aborts during configure.  The snippet below scans every imported target
-        #  that the newly-found package put in the directory scope; whenever it sees
-        #  a `PkgConfig::X` that is *still* undefined it:
-        #
-        #    1.  runs `pkg_check_modules(X …)`  → this *usually* defines the target;
-        #    2.  if it still isn’t there, synthesises a minimal IMPORTED-INTERFACE
-        #        target that carries include-dirs and libraries obtained from
-        #        pkg-config.
-        # ──────────────────────────────────────────────────────────────────────────
-        #
-        get_property(_new_imported_targets DIRECTORY PROPERTY IMPORTED_TARGETS)
-
-        foreach(_t IN LISTS _new_imported_targets)
-            get_target_property(_iface_libs  "${_t}" INTERFACE_LINK_LIBRARIES)
-
-            foreach(_lib IN LISTS _iface_libs)
-                if(_lib MATCHES "^PkgConfig::([A-Za-z0-9_\\-]+)$"
-                   AND NOT TARGET "${_lib}")
-
-                    set(_pc_mod "${CMAKE_MATCH_1}")
-
-                    # 1) Try to create it via pkg-config
-                    find_package(PkgConfig QUIET)
-                    if(PKG_CONFIG_FOUND)
-                        pkg_check_modules("${_pc_mod}" QUIET "${_pc_mod}")
-                    endif()
-
-                    # 2) If it is *still* missing, fall back to a tiny interface lib
-                    if(NOT TARGET "${_lib}"
-                       AND (DEFINED "${_pc_mod}_LIBRARIES"
-                            OR DEFINED "${_pc_mod}_INCLUDE_DIRS"))
-                        create_imported_package_target(
-                            "${_lib}"
-                            "${${_pc_mod}_INCLUDE_DIRS}"
-                            "${${_pc_mod}_LIBRARIES}"
-                        )
-                        message(STATUS
-                            "[fixup] synthesised ${_lib} "
-                            "(incl=${${_pc_mod}_INCLUDE_DIRS}; "
-                            "libs=${${_pc_mod}_LIBRARIES})")
-                    endif()
-                endif()
-            endforeach()
-        endforeach()
-
-        unset(_new_imported_targets)
-        unset(_iface_libs)
-        unset(_lib)
-        unset(_pc_mod)
-        # ──────────────────────────────────────────────────────────────────────────
-
-        set(${FOUND_PACKAGE} "${PACKAGE_NAME}" PARENT_SCOPE)
-
-        if("${PACKAGE_NAME}" STREQUAL "libjwt")
-            # If the upstream config gave us LibJWT::jwt, alias it.
-            if(TARGET LibJWT::jwt AND NOT TARGET libjwt::libjwt)
-                message(STATUS "[fixup] aliasing libjwt::libjwt -> LibJWT::jwt")
-                add_library(libjwt::libjwt ALIAS LibJWT::jwt)
-            endif()
-
-            # If we later create (or already have) a bare 'jwt' target, alias that.
-            if(TARGET jwt AND NOT TARGET libjwt::libjwt)
-                message(STATUS "[fixup] aliasing libjwt::libjwt -> jwt")
-                add_library(libjwt::libjwt ALIAS jwt)
-            endif()
-
-            # As a last resort create an IMPORTED library yourself when nothing exists.
-            if(NOT TARGET libjwt::libjwt AND NOT TARGET LibJWT::jwt AND NOT TARGET jwt)
-                message(STATUS "[fixup] creating IMPORTED target jwt and alias")
-                add_library(jwt UNKNOWN IMPORTED)
-                # Adjust these two paths to your installation prefix if necessary
-                set_target_properties(jwt PROPERTIES
-                    IMPORTED_LOCATION "/usr/local/opt/libjwt/lib/libjwt.dylib"
-                    INTERFACE_INCLUDE_DIRECTORIES "/usr/local/opt/libjwt/include")
-                add_library(libjwt::libjwt ALIAS jwt)
-            endif()
-        endif()
-
-        return()
-    endif()
-
-    # ------------------------------------------------------------------
-    # Fallback to pkg-config  (only for plain names — see early return)
-    # ------------------------------------------------------------------
-    if(NOT PKG_CONFIG_FOUND)
-        find_package(PkgConfig QUIET)
-        if (NOT PKG_CONFIG_FOUND)
-            message(FATAL_ERROR "pkg-config not found")
-        endif()
-    endif()
-
-    if(PKG_CONFIG_FOUND)
-        pkg_check_modules("${PACKAGE_NAME}" QUIET "${PACKAGE_NAME}")
-        is_package_found("${PACKAGE_NAME}" PACKAGE_FOUND)
-        if(PACKAGE_FOUND)
-            message(STATUS "Found \"${PACKAGE_NAME}\" with pkg-config")
-            string(TOLOWER "${PACKAGE_NAME}" LOWER_NAME)
-            set(TGT_NAME "${LOWER_NAME}::${LOWER_NAME}")
-            create_imported_package_target(
-                "${TGT_NAME}"
-                "${${PACKAGE_NAME}_INCLUDE_DIRS}"
-                "${${PACKAGE_NAME}_LIBRARIES}"
-            )
-            set(${FOUND_PACKAGE} "${PACKAGE_NAME}" PARENT_SCOPE)
-            return()
-        endif()
-    endif()
-
-    # ------------------------------------------------------------------
-    # Last-chance scan of typical CMake install paths
-    # ------------------------------------------------------------------
-    set(CMAKE_FALLBACK_PATHS
-        /usr/local/lib/cmake
-        /usr/local/share
-        /opt/homebrew/lib/cmake
-        /usr/lib/cmake
-        /usr/share/cmake
-        ${CMAKE_CUSTOM_PACKAGE_PATHS}
+    # 2. Always build (or replace) the PkgConfig::<MOD> interface target
+    set(_pc_target "PkgConfig::${MODULE_NAME}")
+    create_imported_package_target(
+        "${_pc_target}"
+        "${${MODULE_NAME}_INCLUDE_DIRS}"
+        "${${MODULE_NAME}_LIBRARIES}"
     )
-    foreach(PATH ${CMAKE_FALLBACK_PATHS})
-        file(GLOB CMAKE_CONFIG_FILES
-            "${PATH}/${PACKAGE_NAME}*/${PACKAGE_NAME}*-config.cmake"
-            "${PATH}/${PACKAGE_NAME}*/CMakeLists.txt"
-        )
-        foreach(CMAKE_CONFIG_FILE ${CMAKE_CONFIG_FILES})
-            message(STATUS "Considering CMake configuration file: \"${CMAKE_CONFIG_FILE}\"")
-            include("${CMAKE_CONFIG_FILE}")
-            is_package_found("${PACKAGE_NAME}" PACKAGE_FOUND)
-            if(PACKAGE_FOUND)
-                message(STATUS "Successfully included \"${CMAKE_CONFIG_FILE}\" for \"${PACKAGE_NAME}\"")
-                set(${FOUND_PACKAGE} "${PACKAGE_NAME}" PARENT_SCOPE)
-                return()
+
+    # 3. (optional) also provide a shorter <mod>::<mod> alias
+    string(TOLOWER "${MODULE_NAME}" _lower)
+    set(_alias "${_lower}::${_lower}")
+    if(NOT TARGET "${_alias}")
+        add_library("${_alias}" ALIAS "${_pc_target}")
+    endif()
+endfunction()
+
+
+
+function(_find_generic_package_quiet PACKAGE_NAME FOUND_PACKAGE)
+  message(STATUS "Trying to find \"${PACKAGE_NAME}\"")
+  # assume failure by default
+  set(${FOUND_PACKAGE} "not_found" PARENT_SCOPE)
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # 0) FAST PATH: if *any* of the common targets already exist, accept & mark
+  #    the package as FOUND. This happens when another package's Config.cmake
+  #    called find_dependency(${PACKAGE_NAME}) for us.
+  # ────────────────────────────────────────────────────────────────────────────
+  foreach(_cand
+          "${PACKAGE_NAME}::${PACKAGE_NAME}"
+          "${PACKAGE_NAME}::static"
+          "${PACKAGE_NAME}::shared"
+          "${PACKAGE_NAME}::debug")
+    if(TARGET "${_cand}")
+      message(STATUS "[fast-path] ${PACKAGE_NAME} already available as target \"${_cand}\"")
+      string(TOUPPER "${PACKAGE_NAME}" _UP)
+      set(${PACKAGE_NAME}_FOUND TRUE PARENT_SCOPE)
+      set(${_UP}_FOUND          TRUE PARENT_SCOPE)
+      set(${FOUND_PACKAGE} "${PACKAGE_NAME}" PARENT_SCOPE)
+      return()
+    endif()
+  endforeach()
+
+  #
+  # 1) If the caller literally passed a ::‑qualified target, try that and return
+  #
+  if("${PACKAGE_NAME}" MATCHES "::")
+    find_generic_target("${PACKAGE_NAME}" FOUND)
+    if(NOT "${FOUND}" STREQUAL "not_found")
+      set(${FOUND_PACKAGE} "${FOUND}" PARENT_SCOPE)
+    endif()
+    return()
+  endif()
+
+  #
+  # 2) Snapshot which IMPORTED_TARGETS exist right now
+  #
+  get_property(_before_targets DIRECTORY PROPERTY IMPORTED_TARGETS)
+
+  #
+  # 3) Try the normal find_package
+  #
+  find_package("${PACKAGE_NAME}" QUIET)
+
+  #
+  # 4) OpenSSL sometimes only shows up under CONFIG mode
+  #
+  if("${PACKAGE_NAME}" STREQUAL "OpenSSL" AND NOT TARGET OpenSSL::Crypto)
+    find_package(OpenSSL CONFIG REQUIRED)
+  endif()
+
+  #
+  # 5) Snapshot again, and compute the *new* imported targets
+  #
+  get_property(_after_targets DIRECTORY PROPERTY IMPORTED_TARGETS)
+  set(_new_targets)
+  foreach(_t IN LISTS _after_targets)
+    list(FIND _before_targets "${_t}" _idx)
+    if(_idx EQUAL -1 AND NOT _t MATCHES "^PkgConfig::")
+      list(APPEND _new_targets "${_t}")
+    endif()
+  endforeach()
+
+  # after you compute _new_targets from find_package()
+  foreach(_tgt IN LISTS _new_targets)
+    get_target_property(_iface_libs "${_tgt}" INTERFACE_LINK_LIBRARIES)
+    foreach(_dep IN LISTS _iface_libs)
+      if(_dep MATCHES "^PkgConfig::([A-Za-z0-9_\\-]+)$" AND NOT TARGET "${_dep}")
+        _ensure_pkgconfig_target("${CMAKE_MATCH_1}")
+        message(STATUS "[fixup] imported pkg‑config dependency ${CMAKE_MATCH_1} → ${_dep}")
+      endif()
+    endforeach()
+  endforeach()
+
+  if(_new_targets)
+    message(STATUS "find_package(${PACKAGE_NAME}) added targets: ${_new_targets}")
+
+    #
+    # 6) Special‑case libjwt → alias LibJWT::jwt → libjwt::libjwt (and bare jwt)
+    #
+    if("${PACKAGE_NAME}" STREQUAL "libjwt")
+      if(TARGET LibJWT::jwt AND NOT TARGET libjwt::libjwt)
+        add_library(libjwt::libjwt ALIAS LibJWT::jwt)
+      endif()
+      if(TARGET jwt AND NOT TARGET libjwt::libjwt)
+        add_library(libjwt::libjwt ALIAS jwt)
+      endif()
+    endif()
+
+    #
+    # 7) SELF‑HEAL: for each new target, pull in any PkgConfig::FOO deps it lists
+    #
+    foreach(_tgt IN LISTS _new_targets)
+      get_target_property(_iface_libs "${_tgt}" INTERFACE_LINK_LIBRARIES)
+      foreach(_dep IN LISTS _iface_libs)
+        if(_dep MATCHES "^PkgConfig::([A-Za-z0-9_-]+)$")
+          set(_mod "${CMAKE_MATCH_1}")
+          find_package(PkgConfig QUIET)
+          if(PKG_CONFIG_FOUND)
+            pkg_check_modules("${_mod}" QUIET "${_mod}")
+            if(DEFINED ${_mod}_LIBRARIES OR DEFINED ${_mod}_INCLUDE_DIRS)
+              string(TOLOWER "${_mod}" _lower)
+              set(_alias "${_lower}::${_lower}")
+              create_imported_package_target(
+                "${_alias}"
+                "${${_mod}_INCLUDE_DIRS}"
+                "${${_mod}_LIBRARIES}"
+              )
+              message(STATUS "[fixup] imported pkg‑config dependency ${_mod} → ${_alias}")
             endif()
-        endforeach()
+          endif()
+        endif()
+      endforeach()
     endforeach()
 
-    # ------------------------------------------------------------------
-    # Still not found
-    # ------------------------------------------------------------------
-    message(STATUS "Could not find \"${PACKAGE_NAME}\"")
+    #
+    # 8) If exactly one of the new targets is named “Pkg::Pkg”, auto‑alias Pkg::Pkg → that
+    #
+    list(FILTER _new_targets INCLUDE REGEX "^${PACKAGE_NAME}::")
+    list(LENGTH  _new_targets _count)
+    if(_count EQUAL 1)
+      list(GET _new_targets 0 _only)
+      set(_alias "${PACKAGE_NAME}::${PACKAGE_NAME}")
+      if(NOT TARGET "${_alias}")
+        message(STATUS "Auto‑aliasing ${_alias} → ${_only}")
+        add_library("${_alias}" ALIAS "${_only}")
+      endif()
+    endif()
+
+    # Mark FOUND
+    string(TOUPPER "${PACKAGE_NAME}" _UP)
+    set(${PACKAGE_NAME}_FOUND TRUE PARENT_SCOPE)
+    set(${_UP}_FOUND          TRUE PARENT_SCOPE)
+    set(${FOUND_PACKAGE} "${PACKAGE_NAME}" PARENT_SCOPE)
+    return()
+  endif()
+
+  #
+  # 9) Fallback: pkg‑config for plain names
+  #
+  find_package(PkgConfig QUIET)
+  if(PKG_CONFIG_FOUND)
+    pkg_check_modules("${PACKAGE_NAME}" QUIET "${PACKAGE_NAME}")
+    if(DEFINED ${PACKAGE_NAME}_LIBRARIES OR DEFINED ${PACKAGE_NAME}_INCLUDE_DIRS)
+      string(TOLOWER "${PACKAGE_NAME}" _lower)
+      set(_alias "${_lower}::${_lower}")
+      create_imported_package_target(
+        "${_alias}"
+        "${${PACKAGE_NAME}_INCLUDE_DIRS}"
+        "${${PACKAGE_NAME}_LIBRARIES}"
+      )
+      message(STATUS "Found \"${PACKAGE_NAME}\" via pkg‑config → alias ${_alias}")
+      string(TOUPPER "${PACKAGE_NAME}" _UP)
+      set(${PACKAGE_NAME}_FOUND TRUE PARENT_SCOPE)
+      set(${_UP}_FOUND          TRUE PARENT_SCOPE)
+      set(${FOUND_PACKAGE} "${PACKAGE_NAME}" PARENT_SCOPE)
+      return()
+    endif()
+  endif()
+
+  #
+  # 10) Last chance: scan common <pkg>-config.cmake paths
+  #
+  foreach(_path IN LISTS
+      /usr/local/lib/cmake
+      /usr/local/share
+      /opt/homebrew/lib/cmake
+      /usr/lib/cmake
+      /usr/share/cmake
+      ${CMAKE_CUSTOM_PACKAGE_PATHS}
+    )
+    file(GLOB _cfgs
+      "${_path}/${PACKAGE_NAME}*/${PACKAGE_NAME}*-config.cmake"
+      "${_path}/${PACKAGE_NAME}*/CMakeLists.txt"
+    )
+    foreach(_cfg IN LISTS _cfgs)
+      message(STATUS "Considering CMake config: \"${_cfg}\"")
+      include("${_cfg}")
+      foreach(_cand
+              "${PACKAGE_NAME}::${PACKAGE_NAME}"
+              "${PACKAGE_NAME}::static"
+              "${PACKAGE_NAME}::shared"
+              "${PACKAGE_NAME}::debug")
+        if(TARGET "${_cand}")
+          message(STATUS "Found target via ${_cfg}: ${_cand}")
+          string(TOUPPER "${PACKAGE_NAME}" _UP)
+          set(${PACKAGE_NAME}_FOUND TRUE PARENT_SCOPE)
+          set(${_UP}_FOUND          TRUE PARENT_SCOPE)
+          set(${FOUND_PACKAGE} "${PACKAGE_NAME}" PARENT_SCOPE)
+          return()
+        endif()
+      endforeach()
+    endforeach()
+  endforeach()
+
+  message(STATUS "Could not find \"${PACKAGE_NAME}\"")
 endfunction()
 
 
@@ -397,13 +485,24 @@ function(find_generic_package PACKAGE_NAME)
 endfunction()
 
 function(is_header_only_library TARGET RESULT_VAR)
+    # default
     set(${RESULT_VAR} FALSE PARENT_SCOPE)
-    message(STATUS "Checking if ${TARGET}::${TARGET} is a header-only library")
-    if(TARGET ${TARGET}::debug)
-        message(STATUS "Found ${TARGET}::debug")
+
+    message(STATUS "Checking if ${TARGET} is a header-only library")
+
+    # If *any* compiled variant exists, it's not header-only
+    if(TARGET ${TARGET}::debug OR TARGET ${TARGET}::static OR TARGET ${TARGET}::shared)
+        message(STATUS "Found a compiled variant of ${TARGET} → NOT header-only")
         set(${RESULT_VAR} FALSE PARENT_SCOPE)
-    else()
-        message(STATUS "Header only library ${TARGET}::${TARGET}")
-        set(${RESULT_VAR} TRUE PARENT_SCOPE)
+        return()
+    endif()
+
+    # If the canonical target exists and it's an INTERFACE lib, treat as header-only
+    if(TARGET ${TARGET}::${TARGET})
+        get_target_property(_t ${TARGET}::${TARGET} TYPE)
+        if(_t STREQUAL "INTERFACE_LIBRARY")
+            message(STATUS "Header only library ${TARGET}::${TARGET}")
+            set(${RESULT_VAR} TRUE PARENT_SCOPE)
+        endif()
     endif()
 endfunction()

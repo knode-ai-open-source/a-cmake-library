@@ -27,38 +27,66 @@
 ################################################################################
 
 if(ENABLE_CODE_COVERAGE)
-    find_program(GENHTML_EXECUTABLE genhtml)
 
-    if(HAS_COVERAGE_FLAG)
+    # Ensure compiler flag check variable exists
+    if(NOT DEFINED HAS_COVERAGE_FLAG)
+        set(HAS_COVERAGE_FLAG FALSE)
+    endif()
+
+    # Locate tools (they might already be cached from CodeCoverage.cmake)
+    find_program(LCOV_EXECUTABLE   lcov)
+    find_program(GENHTML_EXECUTABLE genhtml)
+    find_program(LLVM_COV_EXECUTABLE llvm-cov)
+    find_program(GCOV_EXECUTABLE   gcov)
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # Preferred path: compiler supports --coverage AND we have lcov & genhtml
+    # ──────────────────────────────────────────────────────────────────────────
+    if(HAS_COVERAGE_FLAG AND LCOV_EXECUTABLE AND GENHTML_EXECUTABLE)
+
         add_custom_target(coverage
-            COMMAND lcov --capture --directory ${CMAKE_BINARY_DIR} --output-file coverage.info
-            COMMAND genhtml coverage.info --output-directory coverage-report
-            COMMENT "Generating coverage report using lcov and genhtml"
-        )
-    elseif(LCOV_EXECUTABLE AND GENHTML_EXECUTABLE)
-        add_custom_target(coverage
-            COMMAND ${LCOV_EXECUTABLE} --capture --directory . --output-file coverage.info
-            COMMAND ${LCOV_EXECUTABLE} --remove coverage.info '/usr/*' "${CMAKE_BINARY_DIR}/*" --output-file coverage.info
-            COMMAND ${GENHTML_EXECUTABLE} coverage.info --output-directory coverage-report
+            COMMAND ${LCOV_EXECUTABLE}  --capture
+                                         --directory ${CMAKE_BINARY_DIR}
+                                         --output-file coverage.info
+            COMMAND ${LCOV_EXECUTABLE}  --remove  coverage.info '/usr/*'
+                                         "${CMAKE_BINARY_DIR}/*"
+                                         --output-file coverage.info
+            COMMAND ${GENHTML_EXECUTABLE} coverage.info
+                                          --output-directory coverage-report
             WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
-            COMMENT "Generating code coverage report")
+            COMMENT "Generating coverage report with lcov/genhtml")
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # Fallback: llvm‑cov
+    # ──────────────────────────────────────────────────────────────────────────
     elseif(LLVM_COV_EXECUTABLE)
+
+        # Reports for every target can get messy.  Here we assume the primary
+        # target has the project name; adjust if necessary.
         add_custom_target(coverage
-            COMMAND ${LLVM_COV_EXECUTABLE} report --instr-profile=coverage.profdata
-                --object ${CMAKE_BINARY_DIR}/<library-or-executable>
+            COMMAND ${LLVM_COV_EXECUTABLE} report
+                     --instr-profile=coverage.profdata
+                     --object $<TARGET_FILE:${PROJECT_NAME}>
             WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
-            COMMENT "Generating coverage report using llvm-cov"
-        )
+            COMMENT "Generating coverage report with llvm-cov")
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # Last resort: gcov
+    # ──────────────────────────────────────────────────────────────────────────
     elseif(GCOV_EXECUTABLE)
-        # Add a custom target to generate gcov reports
+
         add_custom_target(coverage
             COMMAND ${CMAKE_COMMAND} -E make_directory coverage-report
-            COMMAND find ${CMAKE_BINARY_DIR} -name "*.gcno" -execdir ${GCOV_EXECUTABLE} -o . {} \\\; > coverage-report/coverage.txt
-            COMMAND cat coverage-report/coverage.txt
+            COMMAND ${GCOV_EXECUTABLE} -b -r
+                    $(find ${CMAKE_BINARY_DIR} -name \"*.gcno\") >
+                    coverage-report/coverage.txt
             WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
-            COMMENT "Generating code coverage report using gcov")
+            COMMENT "Generating coverage report with gcov")
+
     else()
-        message(WARNING "No suitable code coverage tool found. Code coverage is disabled.")
-        set(ENABLE_CODE_COVERAGE OFF)
+        message(WARNING "No suitable code‑coverage tool found; 'coverage' "
+                        "target will not be created.")
     endif()
+
 endif()
+

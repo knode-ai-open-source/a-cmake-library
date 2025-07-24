@@ -65,42 +65,46 @@
 # endif()
 ################################################################################
 
-# Common to all libraries
-set(INSTALL_LIBDIR lib)
-set(INSTALL_INCLUDEDIR include)
-set(INSTALL_BINDIR bin)
-set(INSTALL_DOCDIR share/doc/${PROJECT_NAME})
+include(GNUInstallDirs)
 
-# Options
-option(DEBUG "Enable debugging" OFF)
-option(ADDRESS_SANITIZER "Enable Address Sanitizer" OFF)
-option(SHARED_BUILD "Build shared libraries" OFF)
-option(STATIC_BUILD "Build static libraries" ON)
-option(DEBUG_BUILD "Build debug libraries" ON)
-option(BUILD_TESTING "Build tests" OFF)
+# Common to all libraries (project‑scoped, relocatable-friendly)
+set(INSTALL_LIBDIR     "${CMAKE_INSTALL_LIBDIR}")
+set(INSTALL_INCLUDEDIR "${CMAKE_INSTALL_INCLUDEDIR}")
+set(INSTALL_BINDIR     "${CMAKE_INSTALL_BINDIR}")
+set(INSTALL_DOCDIR     "${CMAKE_INSTALL_DATAROOTDIR}/doc/${PROJECT_NAME}")
+
+# ---- Options -----------------------------------------------------------------
+option(DEBUG               "Enable debugging"                OFF)
+option(ADDRESS_SANITIZER   "Enable Address Sanitizer"        OFF)
+option(SHARED_BUILD        "Build shared libraries"          OFF)
+option(STATIC_BUILD        "Build static libraries"          ON)
+option(DEBUG_BUILD         "Build debug libraries"           ON)
+option(BUILD_TESTING       "Build tests"                     OFF)
 option(ENABLE_CODE_COVERAGE "Enable code coverage reporting" OFF)
-option(ENABLE_CLANG_TIDY "Enable Clang-Tidy analysis" OFF)
+option(ENABLE_CLANG_TIDY   "Enable Clang‑Tidy analysis"      OFF)
 
-# C version
-set(CMAKE_C_STANDARD 23)
+# ---- C standard (fallback to C17 if compiler lacks C23) -----------------------
+include(CheckCCompilerFlag)
+check_c_compiler_flag("-std=c23" _HAS_C23)
+if (_HAS_C23)
+    set(CMAKE_C_STANDARD 23)
+else()
+    set(CMAKE_C_STANDARD 17)
+endif()
 set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_C_EXTENSIONS OFF)
 
-# Compiler options
-if(ADDRESS_SANITIZER)
+# ---- Sanitizers / tooling -----------------------------------------------------
+if (ADDRESS_SANITIZER)
     add_compile_options(-fsanitize=address)
 endif()
-
-if(ENABLE_CLANG_TIDY)
+if (ENABLE_CLANG_TIDY)
     set(CMAKE_C_CLANG_TIDY clang-tidy)
 endif()
 
-if(EXISTS "/opt/homebrew/opt/openssl")
-    # Add the path if it exists
+# ---- Homebrew OpenSSL hint (macOS) -------------------------------------------
+if (EXISTS "/opt/homebrew/opt/openssl")
     set(OpenSSL_DIR "/opt/homebrew/opt/openssl/lib/cmake/OpenSSL")
-    message(STATUS "set OpenSSL_DIR to ${OpenSSL_DIR}")
-else()
-    message(STATUS "/opt/homebrew/opt/openssl does not exist (maybe not a mac?)")
 endif()
 
 include(${CMAKE_CURRENT_LIST_DIR}/BinaryLibraryFunctions.cmake)
